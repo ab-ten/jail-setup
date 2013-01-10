@@ -1,0 +1,179 @@
+#!/usr/bin/make -f 
+# -*- mode:Makefile; -*-
+
+MASTER	?= /etc
+JAILBASE?= /home/jail
+DEST	?= ${JAILBASE}/etc.common
+
+ETC_SYMLINK_FILES = crontab syslog.conf newsyslog.conf hosts periodic.conf pf.conf
+ETC_EXCLUDE_FILES = master.passwd passwd pwd.db spwd.db dumpdates fstab /rc.conf .svn /ssh /ppp
+JAILTOPDIRS = bin lib libexec sbin root usr var etc tmp
+JAILTOPEMPTY = dev home mnt proc
+EMPTYDIRS = /usr/src /usr/ports /usr/obj
+
+RSYNCOPT = -avHAX --delete \
+ --exclude="*~" \
+ --exclude="/fstab.*" \
+ --exclude="/rc.conf.*" \
+ `for f in ${ETC_EXCLUDE_FILES} ; do echo "--exclude=$$f" ; done` \
+ `for f in ${ETC_SYMLINK_FILES} ; do echo "--exclude=/$$f" ; done`
+
+.PHONY: copy symlink all help \
+	prepare-jail prepare-jail-check prepare-jail-makedir
+
+help:
+	@echo "to setup or syncronize host environment and jail common settings."
+	@echo "  jail-setup"
+	@echo "build or resync a jail."
+	@echo "  jail-setup prepare-jail JAILNNAME=jailname"
+
+all: copy symlink ${DEST}/master.passwd ${DEST}/hosts.common ${DEST}/rc.conf
+	mkdir -p ${DEST}/ssh ${DEST}/ppp
+	@echo "Done."
+
+copy:
+	@echo rsync $(RSYNCOPT) `realpath "${MASTER}"`/ `realpath "$(DEST)"`
+	@rsync $(RSYNCOPT) `realpath "${MASTER}"`/ `realpath "$(DEST)"`
+
+${DEST}/master.passwd: ${MASTER}/master.passwd
+	grep -v -F "(NOJAIL)" < $> > $@
+	pwd_mkdb -p -d "${DEST}" ${DEST}/master.passwd
+
+${DEST}/hosts.common: ${MASTER}/hosts
+	grep -qF sysloghost ${MASTER}/hosts
+	sed -e '/^#NOJAIL#/,$$d' $> > $@
+
+${DEST}/rc.conf:
+	-mv $@ $@.bak
+	echo 'sendmail_enable="NO"'		>> $@
+	echo 'sendmail_submit_enable="NO"'	>> $@
+	echo 'sendmail_outbound_enable="NO"'	>> $@
+	echo 'sendmail_msp_queue_enable="NO"'	>> $@
+	echo '[ -r /root/rc.conf.local ] && . /root/rc.conf.local'	>> $@
+
+symlink:
+	for f in ${ETC_SYMLINK_FILES} ; do [ -L "${DEST}/$$f" ] || ln -vsf /root/$$f ${DEST}/$$f ; done
+
+
+
+prepare-jail: prepare-jail-check prepare-jail-makedir prepare-jail-ssh	\
+	${JAILBASE}/${JAILNAME}-root/hosts	\
+	${JAILBASE}/${JAILNAME}-root/syslog.conf	\
+	${JAILBASE}/${JAILNAME}-root/rc.conf.local	\
+	${JAILBASE}/${JAILNAME}-root/crontab		\
+	${JAILBASE}/${JAILNAME}-root/newsyslog.conf	\
+	${JAILBASE}/${JAILNAME}-root/periodic.conf	\
+	${MASTER}/fstab.${JAILNAME}		\
+	${MASTER}/rc.conf.${JAILNAME}
+
+prepare-jail-check:
+	@if [ -z "${JAILNAME}" ] ; then echo "please specify JAILNAME=foo" ; false ; fi
+	@if ! grep -q '\bjail-${JAILNAME}\b' ${MASTER}/hosts ; then echo "no jail-${JAILNAME} entry in ${MASTER}/hosts" ; false ; fi
+	@if ! grep -q '\bsysloghost\b' ${MASTER}/hosts ; then echo "no sysloghost entry in ${MASTER}/hosts" ; false ; fi
+
+prepare-jail-makedir:
+	mkdir -p "${JAILBASE}/${JAILNAME}"
+	mkdir -p "/var/jail/${JAILNAME}"
+	[ ! -f "${MASTER}/fstab.${JAILNAME}" ] || rm "${MASTER}/fstab.${JAILNAME}"
+	for f in ${JAILTOPDIRS} ${JAILTOPEMPTY} ; do	\
+		mkdir -pv "${JAILBASE}/${JAILNAME}/$$f" ; done
+	mkdir -pv ${JAILBASE}/${JAILNAME}-root
+	mkdir -p "/tmp/jail.${JAILNAME}"
+	chmod 1777 "/tmp/jail.${JAILNAME}"
+	chflags sunlink "/tmp/jail.${JAILNAME}"
+
+${JAILBASE}/${JAILNAME}-root/hosts: ${DEST}/hosts.common \
+				 ${JAILBASE}/${JAILNAME}-root/hosts.local
+	cat ${DEST}/hosts.common > $@
+	if [ -f ${JAILBASE}/${JAILNAME}-root/hosts.local ] ; then	\
+		cat ${JAILBASE}/${JAILNAME}-root/hosts.local >> $@ ; fi
+	grep '\bjail-${JAILNAME}\b' ${MASTER}/hosts >> $@
+
+${JAILBASE}/${JAILNAME}-root/hosts.local: .OPTIONAL
+
+${JAILBASE}/${JAILNAME}-root/syslog.conf:
+	echo '+*'			> $@
+	echo '*.*	@sysloghost:514' >> $@
+
+${JAILBASE}/${JAILNAME}-root/rc.conf.local:
+	echo 'syslogd_enable="YES"'			>> $@
+	echo 'syslogd_flags="-a jail-${JAILNAME}/32:*"'	>> $@
+
+${JAILBASE}/${JAILNAME}-root/crontab:
+	touch $@
+
+${JAILBASE}/${JAILNAME}-root/periodic.conf:
+	touch $@
+
+${JAILBASE}/${JAILNAME}-root/newsyslog.conf:
+	touch $@
+
+prepare-jail-ssh:
+	mkdir -p "${JAILBASE}/${JAILNAME}-ssh"
+	if [ ! -f "${JAILBASE}/${JAILNAME}-ssh/ssh_config" ] ; then \
+		cp -pv ${MASTER}/ssh/ssh_config ${JAILBASE}/${JAILNAME}-ssh/ ; fi
+	if [ ! -f "${JAILBASE}/${JAILNAME}-ssh/sshd_config" ] ; then \
+		cp -pv ${MASTER}/ssh/sshd_config ${JAILBASE}/${JAILNAME}-ssh/ ; fi
+	if [ ! -f "${JAILBASE}/${JAILNAME}-ssh/moduli" ] ; then \
+		cp -pv ${MASTER}/ssh/moduli ${JAILBASE}/${JAILNAME}-ssh/ ; fi
+
+${MASTER}/fstab.${JAILNAME}: ${MASTER}/fstab.${JAILNAME}.local
+	sed -e '1,/^\.ifdef SHELLSTUB_FSTAB/d' ${MAKEFILE} | sed -e '/^.endif/,$$d' |\
+	env JAILNAME="${JAILNAME}" JAILBASE="${JAILBASE}" MASTER="${MASTER}" DEST="${DEST}" ETC_SYMLINK_FILES="${ETC_SYMLINK_FILES}" JAILTOPDIRS="${JAILTOPDIRS}" EMPTYDIRS="${EMPTYDIRS}" FSTAB="${MASTER}/fstab.${JAILNAME}" sh
+	if [ -f "${MASTER}/fstab.${JAILNAME}.local" ] ; then \
+		echo '# appended from ${MASTER}/fstab.${JAILNAME}.local' >> $@ ; \
+		cat ${MASTER}/fstab.${JAILNAME}.local >> $@ ; \
+	fi
+
+${MASTER}/fstab.${JAILNAME}.local: .OPTIONAL
+
+${MASTER}/rc.conf.${JAILNAME}:
+	-mv $@ $@.bak
+	echo 'if [ -z "$$jail_${JAILNAME}_rc_done" ] ; then'	>> $@
+	echo 'jail_${JAILNAME}_rc_done="YES"'		>> $@
+	echo 'jail_${JAILNAME}_devfs_enable="YES"'	>> $@
+	echo 'jail_${JAILNAME}_hostname="${JAILNAME}"'	>> $@
+	echo 'jail_${JAILNAME}_ip=`grep '\''^[:0-9]\+.*[ 	]jail-${JAILNAME}\([ 	].*\|\)$$'\'' /etc/hosts | sed '\''s/[ 	].*$$//'\''`'	>> $@
+	echo 'jail_${JAILNAME}_mount_enable="YES"'	>> $@
+	echo 'jail_${JAILNAME}_rootdir="/home/jail/${JAILNAME}"'	>> $@
+	echo 'syslogd_flags="$$syslogd_flags -a jail-${JAILNAME}/32:*"'	>> $@
+	echo 'fi'	>> $@
+	s='[ -f "${@}" ] && . ${@}' ; if ! grep -qF "$$s" ${MASTER}/rc.conf ; then \
+		echo "$$s" >> ${MASTER}/rc.conf ; fi
+
+.ifdef SHELLSTUB_FSTAB
+for f in ${JAILTOPDIRS} ; do
+  mountpoint="${JAILBASE}/${JAILNAME}/$f"
+  mountsrc="/$f"
+  mountfrags="ro"
+  mount="YES"
+  if [ X"$f" = X"var" ] ; then
+    mountsrc="/var/jail/${JAILNAME}"
+    mountfrags="rw"
+    mtree -Uq -f ${MASTER}/mtree/BSD.var.dist -p "$mountsrc"
+  elif [ X"$f" = X"etc" ] ; then
+    mountsrc="${DEST}"
+  elif [ X"$f" = X"root" ] ; then
+    mountsrc="${JAILBASE}/${JAILNAME}-root"
+  elif [ X"$f" = X"tmp" ] ; then
+    chmod 1777 "$mountpoint"
+    mountsrc="/tmp/jail.${JAILNAME}"
+    mountfrags="rw"
+  fi
+  if [ X"$mount" = X"YES" ] ; then
+    echo "$mountsrc $mountpoint nullfs $mountfrags 0 0" >> ${FSTAB}
+  fi
+done
+
+rwmode="rw"
+if [ -f "${JAILBASE}/${JAILNAME}-ssh/ssh_host_dsa_key" -a \
+     -f "${JAILBASE}/${JAILNAME}-ssh/ssh_host_rsa_key" -a \
+     -f "${JAILBASE}/${JAILNAME}-ssh/ssh_host_key" ] ; then
+  rwmode="ro"
+fi
+echo "${JAILBASE}/${JAILNAME}-ssh ${JAILBASE}/${JAILNAME}/etc/ssh nullfs ${rwmode} 0 0" >> ${FSTAB}
+
+for f in ${EMPTYDIRS} ; do
+  echo "/var/empty ${JAILBASE}/${JAILNAME}$f nullfs ro 0 0" >> ${FSTAB}
+done
+.endif
